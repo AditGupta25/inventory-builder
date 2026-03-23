@@ -191,46 +191,138 @@ async function parsePDF(filePath, onProgress) {
   const data = new Uint8Array(await readFile(filePath));
   const doc = await pdfjsLib.getDocument({ data }).promise;
 
-  // Extract text with position info to reconstruct table rows
-  const allLines = [];
+  // Extract ALL text items with X/Y positions across all pages
+  const allPageRows = []; // Array of { y, items: [{ x, text }] }
   for (let i = 1; i <= doc.numPages; i++) {
     const page = await doc.getPage(i);
     const textContent = await page.getTextContent();
 
-    // Group text items by Y position to reconstruct rows
+    // Group text items by Y position (with tolerance for slight misalignment)
     const yBuckets = new Map();
     for (const item of textContent.items) {
-      const y = Math.round(item.transform[5]); // Y position, rounded to group nearby items
-      if (!yBuckets.has(y)) yBuckets.set(y, []);
-      yBuckets.get(y).push({ x: item.transform[4], text: item.str });
+      if (!item.str.trim()) continue;
+      const rawY = item.transform[5];
+      // Find an existing Y bucket within ±2 units, or create a new one
+      let bucketY = null;
+      for (const existingY of yBuckets.keys()) {
+        if (Math.abs(existingY - rawY) <= 2) { bucketY = existingY; break; }
+      }
+      if (bucketY === null) { bucketY = rawY; yBuckets.set(bucketY, []); }
+      yBuckets.get(bucketY).push({ x: item.transform[4], text: item.str });
     }
 
-    // Sort by Y descending (PDF coords start from bottom), then X ascending
+    // Sort rows by Y descending (PDF coords: bottom=0, top=max)
     const sortedYs = [...yBuckets.keys()].sort((a, b) => b - a);
     for (const y of sortedYs) {
       const items = yBuckets.get(y).sort((a, b) => a.x - b.x);
-      const lineText = items.map(i => i.text).join('\t');
-      if (lineText.trim()) allLines.push(lineText);
+      allPageRows.push({ y, page: i, items });
     }
 
     onProgress?.(`Extracted text from page ${i}/${doc.numPages}`);
   }
 
-  if (allLines.length === 0) {
+  if (allPageRows.length === 0) {
     throw new Error('PDF contains no extractable text. Scanned/image PDFs are not supported.');
   }
 
-  onProgress?.(`Reconstructed ${allLines.length} lines from PDF, detecting structure...`);
+  onProgress?.(`Reconstructed ${allPageRows.length} rows from PDF, detecting columns...`);
 
-  // Try to parse as TSV-like structured data first
+  // ─── X-Position-Based Column Detection ───
+  // Step 1: Find the header row by scoring each row's text content
+  let bestHeaderIdx = 0;
+  let bestScore = -1;
+  for (let i = 0; i < Math.min(allPageRows.length, 30); i++) {
+    const texts = allPageRows[i].items.map(it => it.text);
+    const score = scoreAsHeader(texts);
+    if (score > bestScore) {
+      bestScore = score;
+      bestHeaderIdx = i;
+    }
+  }
+
+  if (bestScore < 2) {
+    // No clear header found — fall back to legacy text-based approach
+    onProgress?.('No clear header found, falling back to text parsing...');
+    return parsePDFFallback(allPageRows, onProgress);
+  }
+
+  const headerRow = allPageRows[bestHeaderIdx];
+  const headerItems = headerRow.items;
+  onProgress?.(`Found PDF header at row ${bestHeaderIdx + 1} (score: ${bestScore.toFixed(1)}) with ${headerItems.length} columns`);
+
+  // Step 2: Define column boundaries from header X positions
+  // Each column boundary = midpoint between this header's X and the next header's X
+  const columns = [];
+  for (let i = 0; i < headerItems.length; i++) {
+    const leftEdge = i === 0 ? 0 : (headerItems[i].x + headerItems[i - 1].x) / 2;
+    const rightEdge = i === headerItems.length - 1 ? Infinity : (headerItems[i].x + headerItems[i + 1].x) / 2;
+    columns.push({
+      name: headerItems[i].text.trim(),
+      x: headerItems[i].x,
+      left: leftEdge,
+      right: rightEdge,
+    });
+  }
+
+  // Step 3: Slot each data row's text items into the correct column
+  const headers = cleanHeaders(columns.map(c => c.name));
+  const dataPageRows = allPageRows.slice(bestHeaderIdx + 1);
+  const rows = [];
+
+  for (const { items } of dataPageRows) {
+    if (items.length < 2) continue;
+
+    const cells = new Array(columns.length).fill('');
+    for (const item of items) {
+      // Find which column this item belongs to based on X position
+      let colIdx = columns.length - 1; // default to last column
+      for (let c = 0; c < columns.length; c++) {
+        if (item.x >= columns[c].left && item.x < columns[c].right) {
+          colIdx = c;
+          break;
+        }
+      }
+      // Append text to the cell (items in same column on same row get joined with space)
+      cells[colIdx] = cells[colIdx] ? cells[colIdx] + ' ' + item.text.trim() : item.text.trim();
+    }
+
+    // Skip rows that are empty or look like totals/summaries
+    const nonEmpty = cells.filter(c => c.trim());
+    if (nonEmpty.length < 2) continue;
+    const firstCell = cells[0].toLowerCase();
+    if (firstCell.includes('total') || firstCell.includes('grand') || firstCell.includes('page ')) continue;
+
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = cells[i] || ''; });
+    rows.push(obj);
+  }
+
+  onProgress?.(`Extracted ${rows.length} rows using column-position detection`);
+
+  if (rows.length > 0) {
+    return { headers, rows, preambleSkipped: bestHeaderIdx, rawRowCount: allPageRows.length };
+  }
+
+  // Fallback if column detection produced no rows
+  return parsePDFFallback(allPageRows, onProgress);
+}
+
+/**
+ * Fallback PDF parsing: join items as text lines, then use Claude or text parsing.
+ */
+async function parsePDFFallback(allPageRows, onProgress) {
+  const allLines = allPageRows.map(({ items }) =>
+    items.map(i => i.text).join('\t')
+  ).filter(l => l.trim());
+
+  // Try parseTextLines first
   const parsed = parseTextLines(allLines);
-
   if (parsed.rows.length > 0) {
-    onProgress?.(`Extracted ${parsed.rows.length} rows from PDF using structure detection`);
+    onProgress?.(`Extracted ${parsed.rows.length} rows from PDF using text-line parsing`);
     return parsed;
   }
 
-  // Fallback: try Claude if available
+  // Try Claude
   onProgress?.('Using AI to extract table structure from PDF...');
   try {
     const fullText = allLines.join('\n').slice(0, 12000);
@@ -246,7 +338,6 @@ async function parsePDF(filePath, onProgress) {
     return { headers, rows, preambleSkipped: result.preamble_rows_skipped || 0, rawRowCount: rawRows.length };
   } catch (err) {
     console.warn('Claude PDF parsing failed:', err.message);
-    // Return what we have from text extraction
     onProgress?.(`Falling back to text-based parsing (${allLines.length} lines)`);
     return parseFallbackText(allLines);
   }
